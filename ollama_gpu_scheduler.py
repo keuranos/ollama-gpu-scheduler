@@ -442,10 +442,12 @@ async def handle_v1(request):
         raise web.HTTPBadRequest(text="scheduler: invalid JSON")
     model = body.get("model", "")
     if request.path == "/v1/embeddings":
-        ollama_body = {"model": model, "prompt": (body.get("input") or [""])[0]}
+        # Upstream ollama serves a REAL OpenAI-shape /v1/embeddings — pass
+        # through untouched (input array, batching, response shape all
+        # preserved). Our own legacy-to-OpenAI reshaping dropped the
+        # "data" wrapper entirely ({"embedding":[...]} without data[]).
         inst = CFG["instances"][order_for(model)[0]]
-        async with app["sess"].post(inst["url"] + "/api/embeddings",
-                                    json=ollama_body,
+        async with app["sess"].post(inst["url"] + "/v1/embeddings", json=body,
                                     timeout=ClientTimeout(total=None, sock_read=600)) as up:
             data = await up.read()
         return web.Response(status=up.status, body=data, content_type="application/json")
