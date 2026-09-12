@@ -400,7 +400,7 @@ async def handle_get(request):
 
 
 async def handle_api(request):
-    """POST /api/chat | /api/generate | /api/embeddings | /api/show"""
+    """POST /api/chat | /api/generate | /api/embed | /api/embeddings | /api/show"""
     app = request.app
     app["request"] = request
     try:
@@ -412,7 +412,10 @@ async def handle_api(request):
         raise web.HTTPBadRequest(text="scheduler: missing model")
     if request.path in ("/api/chat", "/api/generate"):
         return await dispatch(app, model, body)
-    # embeddings / show: passthrough to the affinity instance
+    # embeddings (both legacy /api/embeddings and batched /api/embed) / show:
+    # forwarded raw to the affinity instance — embed models are small, no
+    # placement needed; the body is passed through untouched so the caller's
+    # response shape is preserved exactly.
     inst = CFG["instances"][order_for(model)[0]]
     async with app["sess"].post(inst["url"] + request.path, json=body,
                                 timeout=ClientTimeout(total=None, sock_read=600)) as up:
@@ -598,6 +601,7 @@ def main():
     app.router.add_post("/api/chat", handle_api)
     app.router.add_post("/api/generate", handle_api)
     app.router.add_post("/api/embeddings", handle_api)
+    app.router.add_post("/api/embed", handle_api)
     app.router.add_post("/api/show", handle_api)
     app.router.add_post("/v1/chat/completions", handle_v1)
     app.router.add_post("/v1/completions", handle_v1)
