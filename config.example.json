@@ -9,7 +9,13 @@
 
   "resident": {
     "model": "always-resident-model:latest",
-    "url": "http://127.0.0.1:11438"
+    "url": "http://127.0.0.1:11438",
+    "gpu_uuid": "GPU-zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz"
+  },
+
+  "multi_gpu": {
+    "models": ["huge-model:70b"],
+    "split_slack": 0.9
   },
 
   "affinity": {

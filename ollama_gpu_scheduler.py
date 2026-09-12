@@ -56,7 +56,10 @@ def load_config(path):
 
     inst = {}
     for e in cfg.get("instances", []):
-        inst[e["name"]] = {"url": e["url"].rstrip("/"), "gpu": e["gpu_uuid"]}
+        gpus = e.get("gpus") or ([e["gpu_uuid"]] if e.get("gpu_uuid") else [])
+        if not gpus:
+            raise SystemExit("config: instance %r needs gpu_uuid or gpus[]" % e.get("name"))
+        inst[e["name"]] = {"url": e["url"].rstrip("/"), "gpus": gpus}
     if not inst:
         raise SystemExit("config: at least one instance is required")
     cfg["instances"] = inst
@@ -64,6 +67,25 @@ def load_config(path):
     res = cfg.get("resident", {})
     cfg["resident_model"] = res.get("model", "")
     cfg["resident_url"] = res.get("url", "").rstrip("/")
+    cfg["resident_gpu"] = res.get("gpu_uuid", "")
+
+    mg = cfg.get("multi_gpu", {})
+    cfg["multi_models"] = set(mg.get("models", []))
+    cfg["multi_split_slack"] = float(mg.get("split_slack", 0.9))
+
+    # Safety: a multi-GPU instance must never claim the resident model's GPU.
+    if cfg["resident_gpu"]:
+        for name, icfg in cfg["instances"].items():
+            if len(icfg["gpus"]) > 1 and cfg["resident_gpu"] in icfg["gpus"]:
+                raise SystemExit(
+                    "config: multi-GPU instance %r includes the resident GPU" % name)
+
+    # gpu -> instances sharing it (for cross-instance eviction before a
+    # multi-GPU placement, and for multi-lock acquisition)
+    cfg["gpu_shared_by"] = {}
+    for name, icfg in cfg["instances"].items():
+        for g in icfg["gpus"]:
+            cfg["gpu_shared_by"].setdefault(g, []).append(name)
 
     cfg["affinity"] = cfg.get("affinity", {})
     cfg["gpu_budget_gb"] = float(cfg.get("gpu_budget_gb", 30.0))
@@ -201,6 +223,7 @@ async def evict_idle(sess, inst_name, base_url, keep):
 async def try_admit(sess, inst_name, model, body):
     """Pure placement check. CALLER MUST HOLD inst_locks[inst_name]."""
     cfg = CFG["instances"][inst_name]
+    gpus = cfg["gpus"]
     residents = await ps_models(sess, cfg["url"])
     if model in residents:
         return True
@@ -208,23 +231,59 @@ async def try_admit(sess, inst_name, model, body):
     if wgb <= 0.05:          # cloud / remote models do not occupy VRAM
         return True
     need = required_gb(wgb, body)
-    free = await gpu_free_gb(sess, cfg["gpu"])
-    if fits(free, need):
-        return True
-    note("no fit on %s: need %.1fGB free %.1fGB (residents %s)"
-         % (inst_name, need, free, list(residents)))
-    if inflight.get((inst_name, model), 0) == 0:
-        await evict_idle(sess, inst_name, cfg["url"], keep=model)
-        free = await gpu_free_gb(sess, cfg["gpu"])
+    if len(gpus) == 1:
+        free = await gpu_free_gb(sess, gpus[0])
         if fits(free, need):
-            note("fit on %s after eviction (free %.1fGB)" % (inst_name, free))
             return True
+        note("no fit on %s: need %.1fGB free %.1fGB (residents %s)"
+             % (inst_name, need, free, list(residents)))
+        if inflight.get((inst_name, model), 0) == 0:
+            await evict_idle(sess, inst_name, cfg["url"], keep=model)
+            free = await gpu_free_gb(sess, gpus[0])
+            if fits(free, need):
+                note("fit on %s after eviction (free %.1fGB)" % (inst_name, free))
+                return True
+        return False
+
+    # ---- multi-GPU placement (tensor split across N cards) ----
+    frees = [await gpu_free_gb(sess, g) for g in gpus]
+    total, n = sum(frees), len(gpus)
+    # Ollama splits layers roughly evenly across visible devices; require the
+    # sum to fit AND every card to hold its equal share (with slack) — a
+    # 2GB/55GB pair must not pass on sum alone.
+    per_need = need / n
+    slack = CFG["multi_split_slack"]
+    if total >= need and all(f >= per_need * slack for f in frees):
+        return True
+    note("no multi-GPU fit on %s (%d GPUs): need %.1fGB, free %s (residents %s)"
+         % (inst_name, n, need, ["%.1f" % f for f in frees], list(residents)))
+    if inflight.get((inst_name, model), 0) > 0:
+        return False
+    # Evict idle models on EVERY instance sharing any of these GPUs (the
+    # dual instance itself + single-GPU instances pinned to the same cards),
+    # then re-check once.
+    peers = sorted({p for g in gpus for p in CFG["gpu_shared_by"].get(g, [])})
+    for peer in peers:
+        if inflight.get((peer, "*"), 0):
+            continue
+        await evict_idle(sess, peer, CFG["instances"][peer]["url"], keep=model)
+    frees = [await gpu_free_gb(sess, g) for g in gpus]
+    total = sum(frees)
+    if total >= need and all(f >= per_need * slack for f in frees):
+        note("multi-GPU fit on %s after eviction (free %s)"
+             % (inst_name, ["%.1f" % f for f in frees]))
+        return True
     return False
 
 
 def order_for(model):
+    """Candidate instances for a model. Multi-GPU models route ONLY to
+    multi-GPU instances (and vice versa) — a small model must not squat two
+    cards, a big one cannot fit one."""
+    multi = model in CFG["multi_models"]
+    names = [n for n, c in CFG["instances"].items()
+             if (len(c["gpus"]) > 1) == multi]
     pref = CFG["affinity"].get(model)
-    names = list(CFG["instances"])
     if pref in names:
         names.remove(pref)
         names.insert(0, pref)
@@ -261,18 +320,47 @@ async def dispatch(app, model, body):
         # 1. resident shortcut: never queued, never evicted, never placed
         if model == CFG["resident_model"] and CFG["resident_url"]:
             return await forward(app, CFG["resident_url"], body)
-        # 2. try instances in affinity order (lock held across check+forward)
+        # 2. try instances in affinity order. For single-GPU models the
+        #    per-instance lock is enough. For multi-GPU models the
+        #    RESERVATION acquires the instance lock plus every peer-instance
+        #    lock sharing any of its GPUs, so no single-GPU placement can
+        #    interleave on any card mid-load (locks ordered by id: deadlock-
+        #    free; deduped via dict.fromkeys).
         for inst_name in order_for(model):
-            async with inst_locks[inst_name]:
-                if await try_admit(app["sess"], inst_name, model, body):
-                    cfg = CFG["instances"][inst_name]
-                    inflight[(inst_name, model)] = inflight.get((inst_name, model), 0) + 1
-                    try:
-                        out = await forward(app, cfg["url"], body)
-                        stats["admitted"] += 1
-                        return out
-                    finally:
-                        inflight[(inst_name, model)] -= 1
+            cfg = CFG["instances"][inst_name]
+            gpus = cfg["gpus"]
+            if len(gpus) > 1:
+                peer_names = {p for g in gpus
+                              for p in CFG["gpu_shared_by"].get(g, [])}
+                peer_names.discard(inst_name)
+                lock_list = [inst_locks[inst_name]] + \
+                    [inst_locks[p] for p in sorted(peer_names)]
+                lock_list = list(dict.fromkeys(lock_list))
+                lock_list.sort(key=lambda l: id(l))
+                for l in lock_list:
+                    await l.acquire()
+                try:
+                    if await try_admit(app["sess"], inst_name, model, body):
+                        inflight[(inst_name, model)] = inflight.get((inst_name, model), 0) + 1
+                        try:
+                            out = await forward(app, cfg["url"], body)
+                            stats["admitted"] += 1
+                            return out
+                        finally:
+                            inflight[(inst_name, model)] -= 1
+                finally:
+                    for l in lock_list:
+                        l.release()
+            else:
+                async with inst_locks[inst_name]:
+                    if await try_admit(app["sess"], inst_name, model, body):
+                        inflight[(inst_name, model)] = inflight.get((inst_name, model), 0) + 1
+                        try:
+                            out = await forward(app, cfg["url"], body)
+                            stats["admitted"] += 1
+                            return out
+                        finally:
+                            inflight[(inst_name, model)] -= 1
         # 3. queue
         if time.time() > deadline:
             stats["rejected"] += 1
@@ -393,16 +481,18 @@ async def handle_status(request):
             async with request.app["sess"].get(cfg["url"] + "/api/ps",
                                               timeout=ClientTimeout(total=6)) as up:
                 ms = (await up.json()).get("models", [])
-            instances[name] = [{"name": m["name"],
-                                "vram_gb": round(m.get("size_vram", 0) / 1e9, 1)}
-                               for m in ms]
+            instances[name] = {"gpus": len(cfg["gpus"]),
+                               "residents": [{"name": m["name"],
+                                              "vram_gb": round(m.get("size_vram", 0) / 1e9, 1)}
+                                             for m in ms]}
         except Exception:
-            instances[name] = []
+            instances[name] = {"gpus": len(cfg["gpus"]), "residents": []}
     return web.json_response({
         "queue_depth": len(queue), "queue": list(queue),
         "inflight": {"%s/%s" % k: v for k, v in inflight.items() if v},
         "instances": instances,
         "resident": CFG["resident_model"],
+        "multi_gpu_models": sorted(CFG["multi_models"]),
         "stats": stats,
         "recent_decisions": list(decisions)[-30:],
         "rogue_ollama": state.get("rogue", []),

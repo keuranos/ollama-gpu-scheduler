@@ -88,6 +88,28 @@ python3 test_gpu_scheduler.py   # offline unit tests (monkeypatched nvidia-smi)
 
 Covers: small models co-residing, large blocked by resident large, eviction-then-fit, resident model never scheduled, cloud models bypassing placement, affinity ordering, KV estimate scaling.
 
+## Multi-GPU models (tensor split)
+
+Operator-optional. Add a second Ollama instance whose `CUDA_VISIBLE_DEVICES`
+lists **several** GPUs, register it with `gpus: [...]`, and list the model
+in `multi_gpu.models`:
+
+```json
+"instances": [
+  { "name": "dual", "url": "http://127.0.0.1:11520", "gpus": ["GPU-xxx", "GPU-yyy"] }
+],
+"multi_gpu": { "models": ["huge-model:70b"], "split_slack": 0.9 }
+```
+
+Behaviour:
+- The model routes **only** to multi-GPU instances (small models can never squat two cards, big ones can't fit one).
+- Admission requires the **sum** of free VRAM across the cards to cover the need **and** every card to hold its equal share (± `split_slack`) — Ollama splits layers roughly evenly, so a 2 GB / 55 GB pair must not pass on sum alone.
+- The **reservation**: while a multi-GPU request is being admitted, the scheduler holds the placement locks of *every* instance sharing those GPUs, so a small model can never interleave onto one of the cards mid-load.
+- If the cards are busy: idle models on all sharing instances are evicted, and if still short the request **waits in the queue until two GPUs are free** — exactly like the single-GPU law, one dimension up. RAM spill remains impossible: a split load that cannot get its full footprint is never started.
+
+The backing instance must be started with the multi-GPU visibility itself, e.g.:
+`CUDA_VISIBLE_DEVICES=GPU-xxx,GPU-yyyy OLLAMA_HOST=127.0.0.1:11520 ollama serve`
+
 ## Design notes
 
 - **Why nvidia-smi and not Ollama's own numbers?** Ollama only knows about its own models. The card is shared — other users, other daemons, FLUX/comfy processes. Admission must see the whole truth, which is also why a model that fits *by Ollama's accounting* can still spill.
