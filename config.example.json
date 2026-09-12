@@ -1,0 +1,37 @@
+{
+  "log_tag": "gpusched",
+  "listen": { "host": "127.0.0.1", "port": 11500 },
+
+  "instances": [
+    { "name": "gpu-a", "url": "http://127.0.0.1:11436", "gpu_uuid": "GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" },
+    { "name": "gpu-b", "url": "http://127.0.0.1:11439", "gpu_uuid": "GPU-yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy" }
+  ],
+
+  "resident": {
+    "model": "always-resident-model:latest",
+    "url": "http://127.0.0.1:11438"
+  },
+
+  "affinity": {
+    "big-model:31b": "gpu-a",
+    "code-model:27b": "gpu-b",
+    "nomic-embed-text:latest": "gpu-a"
+  },
+
+  "gpu_budget_gb": 30.0,
+  "weight_safety": 1.12,
+  "kv_gb_per_8k_ctx": 1.0,
+  "kv_cap_gb": 6.0,
+
+  "queue": { "max": 64, "wait_s": 900 },
+
+  "rogue_watch": {
+    "enabled": true,
+    "interval_s": 60,
+    "sanctioned_users": { "mikko": 3, "ollama": 1 }
+  },
+
+  "spill_guard": { "enabled": true, "interval_s": 60, "threshold_gb": 0.5 },
+
+  "size_cache_s": 600
+}
