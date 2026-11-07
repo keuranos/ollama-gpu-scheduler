@@ -2,6 +2,8 @@
 
 A single admission controller that sits in front of **multiple Ollama instances** sharing one or more GPUs.
 
+aion, the agent this infrastructure serves, keeps a live public record at <https://aion.vasama.tech>.
+
 **The problem it solves:** on a box with several Ollama daemons (multi-user server, several agents/pipelines on one machine), nothing coordinates model loads across instances. A load that starts on a GPU without enough free VRAM silently CPU-offloads part of the weights — RAM and swap fill up, and the request dies minutes later with a 500. This has to be experienced to be believed, and then it keeps happening.
 
 **The fix:** point every caller at one proxy instead of the raw instances. Same Ollama API — no call-site code changes. The proxy admits a model load only when the target GPU provably has room.
